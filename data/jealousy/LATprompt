@@ -1,0 +1,29 @@
+jealousy(jealousy.csv)
+User: Read the scenario describing a social comparison between the narrator ('I') and another person. Does the narrator feel 'Envious' of the other person?
+Scenario: {scenario}
+Assistant: The level of envy is 'High' or 'Low'
+
+TEMPLATES = {
+    # F1: 领域相关性
+    "relevance": (
+        "User: Evaluate the importance of the domain to the narrator in the following scenario. Is the importance 'High' or 'Low'?\n"
+        "Scenario: {scenario}\n"
+        "Assistant: The level of importance is"
+    ),
+
+    # F6: 他人 superiority (已精简)
+    "superiority": (
+        "User: Evaluate the other person's advantage over the narrator. Is it 'High' or 'Low'?\n"
+        "Scenario: {scenario}\n"
+        "Assistant: The level of advantage is"
+    ),
+
+
+
+    # F9: 他人衣着/色调 (安慰剂)
+    "clothing": (
+        "User: Is the color tone of the main object 'Grey' or 'Beige'?\n"
+        "Scenario: {scenario}\n"
+        "Assistant: The tone of the main object is"
+    )
+}

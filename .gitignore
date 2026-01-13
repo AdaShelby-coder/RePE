@@ -1,3 +1,6 @@
 __pycache__
 repe.egg-info/
 dist/
+.venv/
+
+token.txt
