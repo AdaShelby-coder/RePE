@@ -1,68 +1,77 @@
+# -*- coding: utf-8 -*-
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch
 import json
 import os
 import numpy as np
 from repe import repe_pipeline_registry
+from token_loader import load_token
 
 # 注册 RepE pipeline
 repe_pipeline_registry()
 
 def load_jealousy_dataset(data_dir, factor):
-    path = os.path.join(data_dir, "jealousy_dataset.json")
+    # Absolute path to the data directory
+    abs_data_dir = "/home/user/syt/representation-engineering/data/jealousy"
+    path = os.path.join(abs_data_dir, "jealousy_dataset.json")
+    
     if not os.path.exists(path):
-        raise FileNotFoundError(f"数据集未找到: {path}。请先运行 generate_jealousy_data.py")
+        # Try relative path
+        path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../data/jealousy/jealousy_dataset.json"))
+        if not os.path.exists(path):
+             raise FileNotFoundError(f"Dataset not found: {path}. Please run generate_jealousy_data.py first")
         
     with open(path, 'r', encoding='utf-8') as f:
         full_dataset = json.load(f)
     
     if factor not in full_dataset:
-        raise ValueError(f"因子 '{factor}' 不在数据集中。可用因子: {list(full_dataset.keys())}")
+        raise ValueError(f"Factor '{factor}' not in dataset. Available factors: {list(full_dataset.keys())}")
         
     return full_dataset[factor]
 
 def main():
-    # --- 1. 配置参数 ---
+    # --- 1. Configuration ---
     model_name_or_path = "meta-llama/Llama-3.1-8B-Instruct" 
     data_dir = "../../data/jealousy"
-    target_factor = "relevance" # 可修改为 'superiority' 或 'clothing'
+    target_factor = "relevance" # Can be changed to 'superiority' or 'clothing'
+    token = load_token()
     
-    print(f"正在加载模型: {model_name_or_path}")
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, device_map="auto")
+    print(f"Loading model: {model_name_or_path}")
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, torch_dtype=torch.float16, device_map="auto", token=token)
     use_fast_tokenizer = "LlamaForCausalLM" not in model.config.architectures
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=use_fast_tokenizer, padding_side="left", legacy=False)
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=use_fast_tokenizer, padding_side="left", legacy=False, token=token)
     
-    # 修正 Padding Token 设置 (Llama 3 最佳实践)
+    # Fix Padding Token setting (Llama 3 Best Practice)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # --- 2. 加载数据 ---
-    print(f"正在加载数据集因子: {target_factor}")
+    # --- 2. Load Data ---
+    print(f"Loading dataset factor: {target_factor}")
     dataset = load_jealousy_dataset(data_dir, target_factor)
     
-    # --- 3. 初始化 RepReading Pipeline ---
+    # --- 3. Initialize RepReading Pipeline ---
     rep_reading_pipeline = pipeline("rep-reading", model=model, tokenizer=tokenizer)
     
-    # --- 4. 提取方向 (PCA) ---
-    # 扫描模型最后几层
+    # --- 4. Extract Directions (PCA) ---
+    # Scan last few layers
     hidden_layers = list(range(-1, -model.config.num_hidden_layers, -1))
     direction_method = 'pca'
     
-    print("开始训练 RepReader (PCA)...")
+    print("Start training RepReader (PCA)...")
     jealousy_rep_reader = rep_reading_pipeline.get_directions(
         dataset['train']['data'], 
-        rep_token=-1,   # 使用最后一个 token 的表示
+        rep_token=-1,   # Use last token representation
         hidden_layers=hidden_layers, 
-        n_difference=1, # 使用成对差异 (High - Low)
+        n_difference=1, # Use pair difference (High - Low)
         train_labels=dataset['train']['labels'], 
         direction_method=direction_method,
         batch_size=8,
     )
     
-    print("训练完成。正在测试集上评估...")
+    print("Training complete. Evaluating on test set...")
     
-    # --- 5. 评估 / 验证 ---
-    # 计算测试数据在提取方向上的投影分数
+    # --- 5. Evaluate / Validate ---
+    # Calculate projection scores of test data on extracted direction
     H_tests = rep_reading_pipeline(
         dataset['test']['data'], 
         rep_token=-1, 
@@ -71,11 +80,11 @@ def main():
         batch_size=8
     )
     
-    # H_tests 包含了每一层的投影分数
-    # 你可以在这里添加代码来计算准确率 (即 High 的分数是否 > Low 的分数)
+    # H_tests contains projection scores for each layer
+    # You can add code here to calculate accuracy (i.e. whether High score > Low score)
     
-    print(f"因子 {target_factor} 的分析已完成。方向已提取。")
-    # 后续可以添加代码保存 direction 或进行可视化
+    print(f"Analysis for factor {target_factor} completed. Direction extracted.")
+    # Code can be added to save direction or visualize
 
 if __name__ == "__main__":
     main()

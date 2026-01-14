@@ -1,29 +1,35 @@
 # -*- coding: utf-8 -*-
+import os
+# Set HF_ENDPOINT to mirror site for faster download - MUST be done before importing transformers
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# Set HF_HOME to a custom directory on NVMe SSD for better performance
+os.environ["HF_HOME"] = "/home/user/syt/hf_models"
+
 import pandas as pd
 import json
-import os
 import sys
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from tqdm import tqdm
+from token_loader import load_token
 
-# 定义每个因子的 Prompt 模板 (参考 data/jealousy/LATprompt 文件)
-# 修改 TEMPLATES 定义，只保留核心 Content，移除硬编码的 User/Assistant
+# Define Prompt Templates for each factor (Reference: data/jealousy/LATprompt)
+# Modified TEMPLATES to keep only core content, removed hardcoded User/Assistant
 TEMPLATES = {
     "relevance": "Evaluate the importance of the domain to the narrator in the following scenario. Is the importance 'High' or 'Low'?:\nScenario: {scenario}",
     "superiority": "Evaluate the other person's advantage over the narrator. Is it 'High' or 'Low'?\nScenario: {scenario}",
     "clothing": "Is the color tone of the main object 'Beige' or 'Grey'?\nScenario: {scenario}"
 }
 
-# 对应的 Assistant 引导词 (Suffix)
+# Corresponding Assistant Suffixes
 SUFFIXES = {
     "relevance": "The level of importance is",
     "superiority": "The level of advantage is",
     "clothing": "The tone of the main object is"
 }
 
-# 定义每个因子的正负标签词
+# Define positive/negative label words for each factor
 TARGET_WORDS = {
     "relevance": {"pos": "High", "neg": "Low"},
     "superiority": {"pos": "High", "neg": "Low"},
@@ -31,63 +37,63 @@ TARGET_WORDS = {
 }
 
 def load_model(model_name="meta-llama/Llama-3.1-8B-Instruct"):
-    # Set HF_ENDPOINT to mirror site for faster download
-    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
     print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
-    tokenizer.pad_token_id = 0
+    # Read token from file or env
+    token = load_token()
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=token)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto", token=token)
+    
+    # Fix Padding Token setting
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
     return model, tokenizer
 
 
 
-def filter_data_by_model(model, tokenizer, pair, factor_name):
+def format_prompt_llama3(tokenizer, template, scenario, suffix):
     """
-    Check if the model correctly predicts this pair of data
-    pair: [pos_text, neg_text] (corresponding to Label 1 and Label 0)
-    factor_name: factor name
+    Format prompt specifically for Llama-3
     """
-    pos_text, neg_text = pair
+    # 1. Build User Message
+    messages = [{"role": "user", "content": template.format(scenario=scenario)}]
+    
+    # 2. Apply Chat Template
+    # add_generation_prompt=True adds <|start_header_id|>assistant<|end_header_id|>
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    
+    # 3. Append Suffix (guide model output)
+    return prompt + suffix
+
+def filter_data_by_model(model, tokenizer, pos_prompt, neg_prompt, factor_name):
+    """
+    Verify if the model can correctly distinguish positive/negative samples
+    """
     targets = TARGET_WORDS[factor_name]
     pos_word = targets["pos"]
     neg_word = targets["neg"]
     
-    # 检查正样本 (High/Beige)
-    # 我们比较 P(pos_word) 和 P(neg_word)
-    # 对于 Mistral 这样的 Instruction 模型，通常预测概率最高的那个词就是它的答案
-    
-    # 获取正样本的 logits
-    inputs_pos = tokenizer(pos_text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        logits_pos = model(**inputs_pos).logits[0, -1, :]
-    
-    # 获取负样本的 logits
-    inputs_neg = tokenizer(neg_text, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        logits_neg = model(**inputs_neg).logits[0, -1, :]
-        
-    # 获取 token ids
+    # Note: Llama3 Tokenizer is sensitive to spaces, usually need to add space before word
     pos_id = tokenizer.encode(" " + pos_word, add_special_tokens=False)[0]
     neg_id = tokenizer.encode(" " + neg_word, add_special_tokens=False)[0]
     
-    # Criteria:
-    # 1. Positive samples tend to output pos_word
-    # 2. Negative samples tend to output neg_word
+    def get_probs(prompt):
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            logits = model(**inputs).logits[0, -1, :]
+        return F.softmax(logits, dim=-1)
+
+    probs_pos_input = get_probs(pos_prompt)
+    probs_neg_input = get_probs(neg_prompt)
     
-    probs_pos = F.softmax(logits_pos, dim=-1)
-    probs_neg = F.softmax(logits_neg, dim=-1)
+    # Logic:
+    # Positive input -> Prob(Pos Word) > Prob(Neg Word)
+    # Negative input -> Prob(Neg Word) > Prob(Pos Word)
+    cond1 = probs_pos_input[pos_id].item() > probs_pos_input[neg_id].item()
+    cond2 = probs_neg_input[neg_id].item() > probs_neg_input[pos_id].item()
     
-    score_pos_pos = probs_pos[pos_id].item()
-    score_pos_neg = probs_pos[neg_id].item()
-    
-    score_neg_pos = probs_neg[pos_id].item()
-    score_neg_neg = probs_neg[neg_id].item()
-    
-    # Only keep this pair if the model predicts correctly on both samples
-    is_pos_correct = score_pos_pos > score_pos_neg
-    is_neg_correct = score_neg_neg > score_neg_pos
-    
-    return is_pos_correct and is_neg_correct
+    return cond1 and cond2
 
 def process_csv(file_path, factor_name, model=None, tokenizer=None):
     print(f"Reading {file_path}")
@@ -106,6 +112,7 @@ def process_csv(file_path, factor_name, model=None, tokenizer=None):
     labels = []
     
     template = TEMPLATES.get(factor_name)
+    suffix = SUFFIXES.get(factor_name)
     if not template:
         print(f"Warning: Template for factor {factor_name} not found, using raw text.")
     
@@ -123,36 +130,41 @@ def process_csv(file_path, factor_name, model=None, tokenizer=None):
         text1 = str(row1['English Text']).strip()
         text2 = str(row2['English Text']).strip()
         
-        # 应用模板
-        if template:
-            text1 = template.format(scenario=text1)
-            text2 = template.format(scenario=text2)
-        
         label1 = int(row1['Label'])
         label2 = int(row2['Label'])
         
-        # 构建配对: [正样本, 负样本]
+        # Determine positive/negative order
         if label1 == 1 and label2 == 0:
-            pair = [text1, text2]
-            current_labels = [1, 0]
+            pos_text, neg_text = text1, text2
         elif label1 == 0 and label2 == 1:
-            pair = [text2, text1]
-            current_labels = [1, 0] 
+            pos_text, neg_text = text2, text1
         else:
-            # print(f"Warning: Row {i} and {i+1} are not a 1-0 pair. Skipping.")
             continue
+            
+        # --- Format Prompt ---
+        if tokenizer:
+            pos_prompt = format_prompt_llama3(tokenizer, template, pos_text, suffix)
+            neg_prompt = format_prompt_llama3(tokenizer, template, neg_text, suffix)
+        else:
+            # For debugging only
+            pos_prompt = f"User: {pos_text}\nAssistant: {suffix}"
+            neg_prompt = f"User: {neg_text}\nAssistant: {suffix}"
             
         total_pairs += 1
         
-        # 模型验证
+        # Model Validation
         if model and tokenizer:
-            if not filter_data_by_model(model, tokenizer, pair, factor_name):
-                # 模型判断错误，跳过该对
+            if not filter_data_by_model(model, tokenizer, pos_prompt, neg_prompt, factor_name):
+                # Skip if model predicts incorrectly
                 continue
         
         valid_count += 1
-        data.extend(pair)
-        labels.append(current_labels)
+        
+        # --- Critical: Store as flat list, keep [Pos, Neg] order ---
+        data.append(pos_prompt)
+        data.append(neg_prompt)
+        labels.append(1)
+        labels.append(0)
         
     if model:
         print(f"  {factor_name}: Kept {valid_count}/{total_pairs} pairs (filtered out model mispredictions)")
@@ -169,7 +181,7 @@ def main():
         print(f"Data directory not found: {data_dir}")
         return
 
-    # 初始化模型 (如果不需要过滤，可以将 use_model 设为 False)
+    # Initialize model (set use_model=False if filtering is not needed)
     use_model = True 
     model = None
     tokenizer = None
@@ -183,9 +195,26 @@ def main():
             use_model = False
 
     factors = ["relevance", "superiority", "clothing"]
-    dataset = {}
+    
+    # 1. Try to load existing dataset for resume capability
+    output_path = os.path.join(data_dir, "jealousy_dataset.json")
+    if os.path.exists(output_path):
+        print(f"Found existing dataset, attempting to resume: {output_path}")
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                dataset = json.load(f)
+        except:
+            print("Load failed, creating new dataset")
+            dataset = {}
+    else:
+        dataset = {}
     
     for factor in factors:
+        # 2. Skip if factor already processed
+        if factor in dataset and len(dataset[factor]['train']['data']) > 0:
+            print(f"Factor {factor} already exists in dataset, skipping.")
+            continue
+
         csv_path = os.path.join(data_dir, f"{factor}.csv")
         if not os.path.exists(csv_path):
             print(f"File not found: {csv_path}")
@@ -213,9 +242,12 @@ def main():
         }
         print(f"  - {factor}: {n_train} training pairs, {n_pairs - n_train} test pairs")
         
-    output_path = os.path.join(data_dir, "jealousy_dataset.json")
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(dataset, f, indent=2, ensure_ascii=False)
+        # 3. Save checkpoint after each factor
+        print(f"Saving checkpoint for {factor}...")
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(dataset, f, indent=2, ensure_ascii=False)
+        print("Saved.")
+        
     print(f"\nSuccessfully saved dataset to: {output_path}")
 
 if __name__ == "__main__":
